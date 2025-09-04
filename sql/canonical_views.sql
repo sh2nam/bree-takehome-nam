@@ -240,7 +240,8 @@ seg AS (
     u.province,
     u.device_os,
     u.acquisition_channel,
-    u.signup_month
+    u.signup_month,
+    u.signup_year
   FROM v_dim_users_clean u
 )
 SELECT
@@ -249,6 +250,7 @@ SELECT
   s.device_os,
   s.acquisition_channel,
   s.signup_month,
+  s.signup_year,
 
   -- funnel timestamps
   a.first_app_open_ts,
@@ -279,6 +281,8 @@ WITH agg AS (
     province,
     device_os,
     acquisition_channel,
+    signup_month,
+    signup_year,
 
     COUNT(DISTINCT user_id)                                                     AS total_users,
     COUNT(DISTINCT CASE WHEN first_app_open_ts  IS NOT NULL THEN user_id END)   AS app_open_users,
@@ -287,12 +291,14 @@ WITH agg AS (
     COUNT(DISTINCT CASE WHEN first_approved_ts  IS NOT NULL THEN user_id END)   AS approved_users,
     COUNT(DISTINCT CASE WHEN first_disbursed_ts IS NOT NULL THEN user_id END)   AS disbursed_users
   FROM v_user_funnel_base
-  GROUP BY 1,2,3
+  GROUP BY 1,2,3,4,5
 )
 SELECT
   province,
   device_os,
   acquisition_channel,
+  signup_month,
+  signup_year,
 
   -- step counts
   total_users,

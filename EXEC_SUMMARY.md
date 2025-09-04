@@ -11,7 +11,9 @@ Evaluate product changes and loan risk dynamics to optimize user growth, repayme
 - **Funnel & Growth Analysis:**  
   - Overall open→disbursed conversion: **47.5%**.  
   - Largest drop-offs: open→link (-28.1pp), request→approved (-23.9pp), and link→request (-13.2pp).  
-  - Channel-level analysis (e.g., **Ontario organic**) shows outsized impact on disbursement growth.  
+  - Channel-level analysis (e.g., **Ontario organic**) shows outsized impact on disbursement growth.
+  - Cohort view highlights a product change around the request flow (month 7) that negatively impacted link→request conversion and cut open→disbursed conversion nearly in half 
+   
   - **Recommendations:**  
     - Improve **bank linking reliability** to improve open→link conversion.  
     - Allow **multiple bank connections** to access more transaction detail and improve link→request + request→approved conversion.  
