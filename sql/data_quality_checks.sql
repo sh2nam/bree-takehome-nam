@@ -43,8 +43,8 @@ SELECT
   COUNT(DISTINCT assignment_id) as unique_keys
 FROM ab_assignments;
 
--- Canonical view row counts (should match base tables)
-CREATE OR REPLACE VIEW dq_view_row_counts AS
+-- Canonical view row counts
+CREATE OR REPLACE VIEW dq_canonical_view_counts AS
 SELECT 
   'v_dim_users_clean' as view_name,
   COUNT(*) as row_count,
@@ -64,37 +64,84 @@ SELECT
 FROM v_fct_loans_clean
 UNION ALL
 SELECT 
+  'v_ab_assignments_clean' as view_name,
+  COUNT(*) as row_count,
+  COUNT(DISTINCT assignment_id) as unique_keys
+FROM v_ab_assignments_clean
+UNION ALL
+SELECT 
   'v_fct_sessions_clean' as view_name,
   COUNT(*) as row_count,
   COUNT(DISTINCT event_id) as unique_keys
 FROM v_fct_sessions_clean
 UNION ALL
 SELECT 
-  'v_ab_assignments_clean' as view_name,
+  'v_user_funnel_base' as view_name,
   COUNT(*) as row_count,
-  COUNT(DISTINCT assignment_id) as unique_keys
-FROM v_ab_assignments_clean;
+  COUNT(DISTINCT user_id) as unique_keys
+FROM v_user_funnel_base
+UNION ALL
+SELECT 
+  'v_funnel_by_segment' as view_name,
+  COUNT(*) as row_count,
+  0 as unique_keys  -- aggregated view
+FROM v_funnel_by_segment
+UNION ALL
+SELECT 
+  'v_user_experiment_assignments' as view_name,
+  COUNT(*) as row_count,
+  COUNT(DISTINCT user_id) as unique_keys
+FROM v_user_experiment_assignments
+UNION ALL
+SELECT 
+  'v_loans_with_experiments' as view_name,
+  COUNT(*) as row_count,
+  COUNT(DISTINCT loan_id) as unique_keys
+FROM v_loans_with_experiments
+UNION ALL
+SELECT 
+  'v_fct_transactions_for_risk' as view_name,
+  COUNT(*) as row_count,
+  COUNT(DISTINCT txn_id) as unique_keys
+FROM v_fct_transactions_for_risk
+UNION ALL
+SELECT 
+  'v_user_prior_loan_perf' as view_name,
+  COUNT(*) as row_count,
+  COUNT(DISTINCT loan_id) as unique_keys
+FROM v_user_prior_loan_perf
+UNION ALL
+SELECT 
+  'v_risk_model_base' as view_name,
+  COUNT(*) as row_count,
+  COUNT(DISTINCT loan_id) as unique_keys
+FROM v_risk_model_base;
 
--- Row count reconciliation report
+-- Row count reconciliation report (base tables vs clean views)
 CREATE OR REPLACE VIEW dq_row_count_reconciliation AS
 WITH base_counts AS (
   SELECT 
-    REPLACE(table_name, 'fct_', '') as entity,
-    REPLACE(table_name, 'dim_', '') as entity_clean,
+    table_name,
     row_count as base_count,
     unique_keys as base_unique_keys
   FROM dq_row_counts
 ),
-view_counts AS (
+clean_view_counts AS (
   SELECT 
-    REPLACE(REPLACE(view_name, 'v_fct_', ''), '_clean', '') as entity,
-    REPLACE(REPLACE(REPLACE(view_name, 'v_dim_', ''), 'v_', ''), '_clean', '') as entity_clean,
+    CASE 
+      WHEN view_name = 'v_dim_users_clean' THEN 'dim_users'
+      WHEN view_name = 'v_fct_transactions_clean' THEN 'fct_transactions'
+      WHEN view_name = 'v_fct_loans_clean' THEN 'fct_loans'
+      WHEN view_name = 'v_fct_sessions_clean' THEN 'fct_sessions'
+      WHEN view_name = 'v_ab_assignments_clean' THEN 'ab_assignments'
+    END as table_name,
     row_count as view_count,
     unique_keys as view_unique_keys
-  FROM dq_view_row_counts
+  FROM dq_canonical_view_counts
+  WHERE view_name IN ('v_dim_users_clean', 'v_fct_transactions_clean', 'v_fct_loans_clean', 'v_fct_sessions_clean', 'v_ab_assignments_clean')
 )
 SELECT 
-  COALESCE(b.entity_clean, v.entity_clean) as entity,
+  COALESCE(b.table_name, v.table_name) as table_name,
   b.base_count,
   v.view_count,
   b.base_unique_keys,
@@ -108,7 +155,7 @@ SELECT
     ELSE 'FAIL'
   END as unique_key_check
 FROM base_counts b
-FULL OUTER JOIN view_counts v ON b.entity_clean = v.entity_clean;
+FULL OUTER JOIN clean_view_counts v ON b.table_name = v.table_name;
 
 -- ========================================================
 -- 2. NOT NULL EXPECTATIONS FOR KEYS
@@ -234,7 +281,7 @@ LEFT JOIN v_dim_users_clean u ON a.user_id = u.user_id
 WHERE u.user_id IS NULL;
 
 -- ========================================================
--- 4. DISTRIBUTION CHECKS & BUSINESS RULE VALIDATIONS
+-- 4. DISTRIBUTION CHECKS & ANALYTICAL VALIDATIONS
 -- ========================================================
 
 -- Transaction amount and direction validations
@@ -378,192 +425,213 @@ SELECT
 FROM v_ab_assignments_clean
 WHERE variant_norm NOT IN ('control', 'treatment', 'variant_a', 'variant_b', 'low', 'high', 'enabled', 'disabled');
 
+-- Distribution checks
+CREATE OR REPLACE VIEW dq_distribution_checks AS
+-- Check user distribution by province
+SELECT 
+  'user_province_distribution' as check_name,
+  province,
+  COUNT(*) as count,
+  ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) as percentage
+FROM v_dim_users_clean
+GROUP BY province
+ORDER BY count DESC;
+
+-- Risk model base data coverage
+CREATE OR REPLACE VIEW dq_risk_model_coverage AS
+SELECT 
+  'Total approved loans' as metric,
+  COUNT(*) as count
+FROM v_risk_model_base
+UNION ALL
+SELECT 
+  'Loans with transaction data' as metric,
+  COUNT(*) as count
+FROM v_risk_model_base
+WHERE txn_info_found = 1
+UNION ALL
+SELECT 
+  'Loans with prior loan history' as metric,
+  COUNT(*) as count
+FROM v_risk_model_base
+WHERE prior_loan_flag = 1
+UNION ALL
+SELECT 
+  'Default loans' as metric,
+  COUNT(*) as count
+FROM v_risk_model_base
+WHERE is_default = 1
+UNION ALL
+SELECT 
+  'Disbursed loans' as metric,
+  COUNT(*) as count
+FROM v_risk_model_base
+WHERE disbursed_at_utc IS NOT NULL;
+
+-- Funnel analysis data quality
+CREATE OR REPLACE VIEW dq_funnel_completeness AS
+SELECT 
+  'Users with app open events' as stage,
+  COUNT(*) as count
+FROM v_user_funnel_base
+WHERE first_app_open_ts IS NOT NULL
+UNION ALL
+SELECT 
+  'Users who linked bank' as stage,
+  COUNT(*) as count
+FROM v_user_funnel_base
+WHERE did_bank_link = 1
+UNION ALL
+SELECT 
+  'Users who requested loans' as stage,
+  COUNT(*) as count
+FROM v_user_funnel_base
+WHERE first_request_ts IS NOT NULL
+UNION ALL
+SELECT 
+  'Users who got approved' as stage,
+  COUNT(*) as count
+FROM v_user_funnel_base
+WHERE first_approved_ts IS NOT NULL;
+
+-- Business rule validations
+CREATE OR REPLACE VIEW dq_business_rules AS
+-- Check for negative loan amounts
+SELECT 
+  'loans_negative_amounts' as rule_name,
+  COUNT(*) as violation_count,
+  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as rule_check
+FROM v_fct_loans_clean
+WHERE amount <= 0
+UNION ALL
+-- Check for future loan request dates
+SELECT 
+  'loans_future_request_dates' as rule_name,
+  COUNT(*) as violation_count,
+  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as rule_check
+FROM v_fct_loans_clean
+WHERE requested_at_utc > CURRENT_TIMESTAMP
+UNION ALL
+-- Check for disbursed loans without disbursement dates
+SELECT 
+  'disbursed_loans_no_disbursement_date' as rule_name,
+  COUNT(*) as violation_count,
+  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as rule_check
+FROM v_fct_loans_clean
+WHERE is_disbursed = 1 AND disbursed_at_utc IS NULL
+UNION ALL
+-- Check for repaid loans without repayment dates
+SELECT 
+  'repaid_loans_no_repayment_date' as rule_name,
+  COUNT(*) as violation_count,
+  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as rule_check
+FROM v_fct_loans_clean
+WHERE is_repaid = 1 AND repaid_at_utc IS NULL
+UNION ALL
+-- Check for transactions with zero amounts
+SELECT 
+  'transactions_zero_amounts' as rule_name,
+  COUNT(*) as violation_count,
+  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as rule_check
+FROM v_fct_transactions_clean
+WHERE amount = 0
+UNION ALL
+-- Check for users with future signup dates
+SELECT 
+  'users_future_signup_dates' as rule_name,
+  COUNT(*) as violation_count,
+  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as rule_check
+FROM v_dim_users_clean
+WHERE signup_at_utc > CURRENT_TIMESTAMP
+UNION ALL
+-- Check for experiment assignment integrity
+SELECT 
+  'experiment_assignments_future_dates' as rule_name,
+  COUNT(*) as violation_count,
+  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as rule_check
+FROM v_ab_assignments_clean
+WHERE assigned_at_utc > CURRENT_TIMESTAMP;
+
 -- ========================================================
--- 5. SUMMARY DATA QUALITY REPORT
+-- SUMMARY DATA QUALITY REPORT
 -- ========================================================
 
 CREATE OR REPLACE VIEW dq_summary_report AS
+WITH all_checks AS (
+  SELECT 'Row Count Reconciliation' as check_category, 
+         row_count_check as status,
+         COUNT(*) as check_count
+  FROM dq_row_count_reconciliation
+  GROUP BY row_count_check
+  
+  UNION ALL
+  
+  SELECT 'Unique Key Reconciliation' as check_category,
+         unique_key_check as status,
+         COUNT(*) as check_count
+  FROM dq_row_count_reconciliation
+  GROUP BY unique_key_check
+  
+  UNION ALL
+  
+  SELECT 'Null Key Checks' as check_category,
+         null_check as status,
+         COUNT(*) as check_count
+  FROM dq_null_key_checks
+  GROUP BY null_check
+  
+  UNION ALL
+  
+  SELECT 'Referential Integrity' as check_category,
+         integrity_check as status,
+         COUNT(*) as check_count
+  FROM dq_referential_integrity
+  GROUP BY integrity_check
+  
+  UNION ALL
+  
+  SELECT 'Business Rules' as check_category,
+         rule_check as status,
+         COUNT(*) as check_count
+  FROM dq_business_rules
+  GROUP BY rule_check
+)
 SELECT 
-  'Row Count Reconciliation' as check_category,
-  SUM(CASE WHEN row_count_check = 'FAIL' OR unique_key_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN row_count_check = 'FAIL' OR unique_key_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_row_count_reconciliation
-UNION ALL
-SELECT 
-  'NULL Key Checks' as check_category,
-  SUM(CASE WHEN null_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN null_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_null_key_checks
-UNION ALL
-SELECT 
-  'Referential Integrity' as check_category,
-  SUM(CASE WHEN integrity_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN integrity_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_referential_integrity
-UNION ALL
-SELECT 
-  'Transaction Validations' as check_category,
-  SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_transaction_validations
-UNION ALL
-SELECT 
-  'Loan Validations' as check_category,
-  SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_loan_validations
-UNION ALL
-SELECT 
-  'User Validations' as check_category,
-  SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_user_validations
-UNION ALL
-SELECT 
-  'Session Validations' as check_category,
-  SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_session_validations
-UNION ALL
-SELECT 
-  'A/B Test Validations' as check_category,
-  SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_ab_test_validations;
+  check_category,
+  status,
+  check_count,
+  CASE 
+    WHEN status = 'PASS' THEN '✓'
+    WHEN status = 'FAIL' THEN '✗'
+    ELSE '?'
+  END as status_icon
+FROM all_checks
+ORDER BY check_category, status;
 
--- ========================================================
--- 6. RISK MODEL VALIDATIONS
--- ========================================================
+-- Quick data quality dashboard
+CREATE OR REPLACE VIEW dq_dashboard AS
+SELECT 
+  'CANONICAL VIEWS' as section,
+  'Total Views Created' as metric,
+  COUNT(*) as value
+FROM dq_canonical_view_counts
+UNION ALL
+SELECT 
+  'DATA COVERAGE' as section,
+  'Risk Model Coverage %' as metric,
+  ROUND(100.0 * SUM(CASE WHEN txn_info_found = 1 THEN 1 ELSE 0 END) / COUNT(*), 1) as value
+FROM v_risk_model_base
+UNION ALL
+SELECT 
+  'DATA QUALITY' as section,
+  'Failed Checks' as metric,
+  SUM(CASE WHEN status = 'FAIL' THEN check_count ELSE 0 END) as value
+FROM dq_summary_report
+UNION ALL
+SELECT 
+  'DATA QUALITY' as section,
+  'Passed Checks' as metric,
+  SUM(CASE WHEN status = 'PASS' THEN check_count ELSE 0 END) as value
+FROM dq_summary_report
+ORDER BY section, metric;
 
--- Risk model row count reconciliation
-CREATE OR REPLACE VIEW dq_risk_row_counts AS
-SELECT 
-  'canonical_vs_approved_loans' as check_name,
-  ABS((SELECT COUNT(*) FROM v_canonical_risk_model) - (SELECT COUNT(*) FROM v_fct_loans_clean WHERE is_approved = 1)) as violation_count,
-  CASE WHEN ABS((SELECT COUNT(*) FROM v_canonical_risk_model) - (SELECT COUNT(*) FROM v_fct_loans_clean WHERE is_approved = 1)) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as validation_check
-UNION ALL
-SELECT 
-  'labels_vs_disbursed_loans' as check_name,
-  ABS((SELECT COUNT(*) FROM v_default_label_30d) - (SELECT COUNT(*) FROM v_fct_loans_clean WHERE is_disbursed = 1)) as violation_count,
-  CASE WHEN ABS((SELECT COUNT(*) FROM v_default_label_30d) - (SELECT COUNT(*) FROM v_fct_loans_clean WHERE is_disbursed = 1)) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as validation_check;
-
--- Risk model timestamp validations
-CREATE OR REPLACE VIEW dq_risk_timestamp_validations AS
-SELECT 
-  'bad_approval_ordering' as check_name,
-  COUNT(*) as violation_count,
-  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as validation_check
-FROM v_fct_loans_clean
-WHERE requested_at_utc IS NOT NULL
-  AND approved_at_utc IS NOT NULL
-  AND requested_at_utc > approved_at_utc
-UNION ALL
-SELECT 
-  'bad_disburse_ordering' as check_name,
-  COUNT(*) as violation_count,
-  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as validation_check
-FROM v_fct_loans_clean
-WHERE approved_at_utc IS NOT NULL
-  AND disbursed_at_utc IS NOT NULL
-  AND approved_at_utc > disbursed_at_utc
-UNION ALL
-SELECT 
-  'negative_days_since_payroll' as check_name,
-  COUNT(*) as violation_count,
-  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as validation_check
-FROM v_canonical_risk_model
-WHERE days_since_last_payroll < 0;
-
--- Risk model ratio validations
-CREATE OR REPLACE VIEW dq_risk_ratio_validations AS
-SELECT 
-  'invalid_spending_ratios' as check_name,
-  (SUM(CASE WHEN rent_share_30d < 0 OR rent_share_30d > 1 THEN 1 ELSE 0 END) +
-   SUM(CASE WHEN essentials_share_14d < 0 OR essentials_share_14d > 1 THEN 1 ELSE 0 END) +
-   SUM(CASE WHEN discretionary_share_14d < 0 OR discretionary_share_14d > 1 THEN 1 ELSE 0 END)) as violation_count,
-  CASE WHEN (SUM(CASE WHEN rent_share_30d < 0 OR rent_share_30d > 1 THEN 1 ELSE 0 END) +
-             SUM(CASE WHEN essentials_share_14d < 0 OR essentials_share_14d > 1 THEN 1 ELSE 0 END) +
-             SUM(CASE WHEN discretionary_share_14d < 0 OR discretionary_share_14d > 1 THEN 1 ELSE 0 END)) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as validation_check
-FROM v_canonical_risk_model;
-
--- Risk model distribution checks
-CREATE OR REPLACE VIEW dq_risk_distribution_checks AS
-SELECT 
-  'extreme_outflow_to_inflow' as check_name,
-  COUNT(*) as violation_count,
-  CASE WHEN COUNT(*) < 10 THEN 'PASS' ELSE 'WARN' END as validation_check
-FROM v_canonical_risk_model
-WHERE outflow_to_inflow_14d > 5 OR outflow_to_inflow_30d > 5
-UNION ALL
-SELECT 
-  'negative_volatility' as check_name,
-  COUNT(*) as violation_count,
-  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as validation_check
-FROM v_canonical_risk_model
-WHERE inflow_volatility_14d < 0 OR inflow_volatility_30d < 0
-UNION ALL
-SELECT 
-  'non_binary_default_labels' as check_name,
-  COUNT(*) as violation_count,
-  CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END as validation_check
-FROM v_default_label_30d
-WHERE default_30d NOT IN (0,1);
-
--- ========================================================
--- 7. UPDATED SUMMARY DATA QUALITY REPORT
--- ========================================================
-
--- Use original summary report to avoid column name issues
-CREATE OR REPLACE VIEW dq_summary_report_extended AS
-SELECT * FROM dq_summary_report
-UNION ALL
-SELECT 
-  'Risk Model Row Counts' as check_category,
-  SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_risk_row_counts
-UNION ALL
-SELECT 
-  'Risk Model Timestamps' as check_category,
-  SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_risk_timestamp_validations
-UNION ALL
-SELECT 
-  'Risk Model Ratios' as check_category,
-  SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_risk_ratio_validations
-UNION ALL
-SELECT 
-  'Risk Model Distributions' as check_category,
-  SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) as failed_checks,
-  COUNT(*) as total_checks,
-  CASE WHEN SUM(CASE WHEN validation_check = 'FAIL' THEN 1 ELSE 0 END) = 0 
-       THEN 'PASS' ELSE 'FAIL' END as category_status
-FROM dq_risk_distribution_checks;

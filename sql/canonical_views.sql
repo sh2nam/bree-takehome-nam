@@ -36,68 +36,27 @@ FROM dim_users u;
 -- ========================================================
 CREATE OR REPLACE VIEW v_fct_transactions_clean AS
 SELECT
-  t.*,
+  f.*,
 
-  -- ratios and volatility features
-  CASE WHEN rolling_14d_inflow_sum > 0 THEN rolling_14d_spend_sum / rolling_14d_inflow_sum END AS rolling_14d_outflow_to_inflow,
-  CASE WHEN rolling_30d_inflow_sum > 0 THEN rolling_30d_spend_sum / rolling_30d_inflow_sum END AS rolling_30d_outflow_to_inflow,
-  CASE WHEN rolling_14d_inflow_sum > 0 THEN rolling_14d_net_cashflow_stddev / rolling_14d_inflow_sum END AS vol_inflow_ratio_14d,
-  CASE WHEN rolling_30d_inflow_sum > 0 THEN rolling_30d_net_cashflow_stddev / rolling_30d_inflow_sum END AS vol_inflow_ratio_30d,
+  -- normalized timestamp
+  f.posted_date::TIMESTAMP AT TIME ZONE 'UTC' AS posted_date_utc,
 
-  -- payroll proximity feature
-  CASE WHEN last_payroll_date IS NOT NULL
-       THEN DATEDIFF('day', last_payroll_date, posted_date)
-       ELSE NULL
-  END AS days_since_last_payroll
+  -- signed helpers (do NOT aggregate here)
+  CASE WHEN f.direction = 'outflow' THEN -f.amount ELSE 0 END AS spend_amount_pos,
+  CASE WHEN f.direction = 'inflow'  THEN  f.amount ELSE 0 END  AS inflow_amount_pos,
 
-FROM (
-  SELECT
-    f.*,
+  -- liquidity flags (atomic)
+  CASE WHEN f.balance_after < 0 THEN 1 ELSE 0 END AS neg_balance_flag,
+  (f.balance_after - f.amount) AS balance_before,
 
-    -- spending categories bucketed
-    CASE
-      WHEN category IN ('groceries','utilities','rent','transport') THEN 'essentials'
-      WHEN category IN ('entertainment','dining')                    THEN 'discretionary'
-      ELSE 'other'
-    END AS spend_bucket,
+  -- spend bucket (simple, auditable)
+  CASE
+    WHEN f.category IN ('groceries','utilities','rent','transport') THEN 'essentials'
+    WHEN f.category IN ('entertainment','dining')                    THEN 'discretionary'
+    ELSE 'other'
+  END AS spend_bucket
 
-    -- normalize date
-    posted_date::TIMESTAMP AT TIME ZONE 'UTC' AS posted_date_utc,
-
-    -- liquidity stress
-    CASE WHEN balance_after < 0 THEN 1 ELSE 0 END AS neg_balance_flag,
-    (balance_after - amount) AS balance_before,
-
-    -- signed amounts for inflows/outflows
-    CASE WHEN direction = 'outflow' THEN -amount ELSE 0 END AS spend_amount_pos,
-    CASE WHEN direction = 'inflow'  THEN  amount ELSE 0 END AS inflow_amount_pos,
-
-    -- rolling sums (14d, 30d)
-    SUM(CASE WHEN direction = 'outflow' THEN -amount ELSE 0 END)  OVER (PARTITION BY user_id ORDER BY posted_date
-      RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS rolling_14d_spend_sum,
-    SUM(CASE WHEN direction = 'outflow' THEN -amount ELSE 0 END)  OVER (PARTITION BY user_id ORDER BY posted_date
-      RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS rolling_30d_spend_sum,
-    SUM(CASE WHEN direction = 'inflow'  THEN  amount ELSE 0 END) OVER (PARTITION BY user_id ORDER BY posted_date
-      RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS rolling_14d_inflow_sum,
-    SUM(CASE WHEN direction = 'inflow'  THEN  amount ELSE 0 END) OVER (PARTITION BY user_id ORDER BY posted_date
-      RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS rolling_30d_inflow_sum,
-
-    -- rolling net cash flow (signed) and volatility
-    SUM(CASE WHEN direction = 'inflow' THEN amount ELSE -amount END) OVER (PARTITION BY user_id ORDER BY posted_date
-      RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS rolling_14d_net_cash_flow,
-    SUM(CASE WHEN direction = 'inflow' THEN amount ELSE -amount END) OVER (PARTITION BY user_id ORDER BY posted_date
-      RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS rolling_30d_net_cash_flow,
-    STDDEV_POP(CASE WHEN direction = 'inflow' THEN amount ELSE -amount END) OVER (PARTITION BY user_id ORDER BY posted_date
-      RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS rolling_14d_net_cashflow_stddev,
-    STDDEV_POP(CASE WHEN direction = 'inflow' THEN amount ELSE -amount END) OVER (PARTITION BY user_id ORDER BY posted_date
-      RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS rolling_30d_net_cashflow_stddev,
-
-    -- last payroll date to track income cadence
-    MAX(CASE WHEN is_payroll = 1 THEN posted_date END) OVER (PARTITION BY user_id
-      ORDER BY posted_date RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS last_payroll_date
-
-  FROM fct_transactions f
-) t;
+FROM fct_transactions f;
 
 -- ========================================================
 -- Cleaned Fact: Loans
@@ -334,68 +293,6 @@ SELECT
   CONCAT(COALESCE(price_variant, 'none'), '_', COALESCE(tip_variant, 'none')) as combined_variant
 FROM user_experiments u;
 
--- Loan performance by experiment groups
-CREATE OR REPLACE VIEW v_experiment_loan_performance AS
-SELECT
-  e.price_test_group,
-  e.tip_test_group,
-  e.is_overlapping_user,
-  COUNT(DISTINCT l.user_id) as users_with_loans,
-  COUNT(l.loan_id) as total_loans,
-  AVG(l.amount) as avg_loan_amount,
-  AVG(l.revenue) as avg_revenue_per_loan,
-  AVG(l.tip_amount) as avg_tip_amount,
-  SUM(CASE WHEN l.status = 'repaid' THEN 1 ELSE 0 END) * 1.0 / COUNT(l.loan_id) as repayment_rate,
-  SUM(CASE WHEN l.status = 'default' THEN 1 ELSE 0 END) * 1.0 / COUNT(l.loan_id) as default_rate,
-  AVG(l.pnl) as avg_pnl_per_loan
-FROM v_user_experiment_assignments e
-LEFT JOIN v_fct_loans_clean l ON e.user_id = l.user_id
-WHERE l.loan_id IS NOT NULL
-GROUP BY 1,2,3;
-
--- ========================================================
--- Risk Modeling Features
--- ========================================================
-
--- User-level risk features for modeling (updated for experiments)
-CREATE OR REPLACE VIEW v_user_risk_features AS
-WITH txn AS (
-  SELECT
-    user_id,
-    SUM(CASE WHEN direction='inflow'  THEN amount ELSE 0 END) AS total_inflows,
-    SUM(CASE WHEN direction='outflow' THEN amount ELSE 0 END) AS total_outflows,
-    COUNT(*)                          AS txn_count,
-    AVG(amount)                       AS avg_txn_amount,
-    STDDEV(amount)                    AS txn_amount_volatility,
-    AVG(balance_after)                 AS avg_balance,
-    MIN(balance_after)                 AS min_balance,
-    SUM(CASE WHEN balance_after < 0 THEN 1 ELSE 0 END) AS neg_balance_days,
-    COUNT(DISTINCT category)          AS unique_spend_categories
-  FROM fct_transactions
-  GROUP BY user_id
-)
-SELECT
-  u.user_id,
-  u.province,
-  u.device_os,
-  u.acquisition_channel,
-  u.baseline_risk_score,
-  u.risk_score_decile,
-
-  -- Transaction features
-  t.total_inflows,
-  t.total_outflows,
-  t.txn_count,
-  CASE WHEN t.total_inflows > 0 THEN t.total_outflows*1.0/t.total_inflows END AS outflow_inflow_ratio,
-  t.avg_balance,
-  t.min_balance,
-  t.neg_balance_days,
-  t.unique_spend_categories,
-  t.txn_amount_volatility,
-
-FROM v_dim_users_clean u
-LEFT JOIN txn t ON u.user_id = t.user_id;
-
 -- ========================================================
 -- Experiment Analysis Views
 -- ========================================================
@@ -424,392 +321,293 @@ FROM v_fct_loans_clean l
 JOIN v_user_experiment_assignments e ON l.user_id = e.user_id
 JOIN v_dim_users_clean u ON l.user_id = u.user_id;
 
--- Daily experiment assignment tracking
-CREATE OR REPLACE VIEW v_experiment_daily_assignments AS
-SELECT
-  assigned_at::DATE AS date,
-  experiment_name,
-  variant,
-  COUNT(DISTINCT user_id) AS users_assigned
-FROM v_ab_assignments_clean
-GROUP BY 1,2,3;
-
--- Funnel analysis by experiment groups
-CREATE OR REPLACE VIEW v_funnel_by_experiment AS
-SELECT
-  e.price_test_group,
-  e.tip_test_group,
-  COUNT(DISTINCT u.user_id) AS total_users,
-  SUM(did_app_open)   AS app_open_users,
-  SUM(did_bank_link)  AS bank_linked_users,
-  SUM(did_request)    AS requested_users,
-  SUM(did_approve)    AS approved_users,
-  SUM(did_disburse)   AS disbursed_users
-FROM v_user_funnel_base u
-JOIN v_user_experiment_assignments e ON u.user_id = e.user_id
-GROUP BY 1,2;
-
--- Loan tip analysis features
-CREATE OR REPLACE VIEW v_loan_tip_features AS
-SELECT
-  loan_id,
-  user_id,
-  CASE WHEN tip_amount > 0 THEN 1 ELSE 0 END AS tip_taken,
-  tip_amount,
-  amount,
-  CASE WHEN amount > 0 THEN tip_amount/amount END AS tip_to_principal
-FROM v_fct_loans_clean;
-
 -- ========================================================
--- Historical Loan Performance (Previous Loans Only)
--- ========================================================
-CREATE OR REPLACE VIEW v_historical_loan_performance AS
-SELECT 
-  current_loan.user_id,
-  current_loan.loan_id,
-  COUNT(prev_loan.loan_id) AS prev_loan_count,
-  CASE 
-    WHEN COUNT(prev_loan.loan_id) > 0 
-    THEN SUM(CASE WHEN prev_loan.status = 'repaid' THEN 1 ELSE 0 END) * 1.0 / COUNT(prev_loan.loan_id)
-    ELSE NULL 
-  END AS hist_repay_rate,
-  CASE 
-    WHEN COUNT(prev_loan.loan_id) > 0 
-    THEN SUM(CASE WHEN prev_loan.status = 'default' THEN 1 ELSE 0 END) * 1.0 / COUNT(prev_loan.loan_id)
-    ELSE null 
-  END AS hist_default_rate,
-  CASE 
-    WHEN COUNT(prev_loan.loan_id) > 0 
-    THEN SUM(CASE WHEN prev_loan.status = 'default' THEN 1 ELSE 0 END)
-    ELSE null 
-  END AS hist_default_count,
-  CASE 
-    WHEN COUNT(prev_loan.loan_id) > 0 
-    THEN avg(prev_loan.late_days)
-    ELSE null 
-  END AS hist_avg_late_days,
-  CASE 
-    WHEN COUNT(prev_loan.loan_id) > 0 
-    THEN sum(case when prev_loan.late_days > 0 then 1 else 0 end)
-    ELSE null 
-  END AS hist_avg_late_days_count
-FROM v_fct_loans_clean current_loan
-LEFT JOIN v_fct_loans_clean prev_loan 
-  ON current_loan.user_id = prev_loan.user_id 
-  AND prev_loan.requested_at_utc < current_loan.requested_at_utc
-  AND prev_loan.is_disbursed = 1  -- Only consider disbursed loans
-GROUP BY current_loan.user_id, current_loan.loan_id;
-
--- Experiment loans with risk features
-CREATE OR REPLACE VIEW v_experiment_loans_risk AS
-SELECT
-  l.*,
-  e.price_test_group,
-  e.tip_test_group,
-  r.risk_score_decile,
-  r.outflow_inflow_ratio,
-  hlp.hist_repay_rate,
-  hlp.hist_default_rate,
-  hlp.hist_default_count
-FROM v_fct_loans_clean l
-JOIN v_user_experiment_assignments e ON l.user_id = e.user_id
-JOIN v_user_risk_features r ON l.user_id = r.user_id
-LEFT JOIN v_historical_loan_performance hlp ON l.loan_id = hlp.loan_id;
-
--- ========================================================
--- For Risk Modeling
+-- Risk Model
 -- ========================================================
 
--- Per-day aggregates + end-of-day balance proxy (uses your spend_bucket)
-CREATE OR REPLACE VIEW v_txn_daily AS
-WITH t AS (
+-- Transactions for risk model
+CREATE OR REPLACE VIEW v_fct_transactions_for_risk AS
+SELECT
+  t.user_id,
+  t.txn_id,
+  t.posted_date_utc,
+
+  /* =========================
+     14-DAY WINDOWS (t-13..t)
+     ========================= */
+  -- Sums
+  SUM(t.inflow_amount_pos)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS inflow_sum_14d,
+  SUM(t.spend_amount_pos)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS spend_sum_14d,
+  SUM(CASE WHEN t.spend_bucket='essentials' THEN t.spend_amount_pos ELSE 0 END)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS essentials_spend_sum_14d,
+  SUM(CASE WHEN t.category='rent' THEN t.spend_amount_pos ELSE 0 END)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS rent_spend_sum_14d,
+
+  -- Counts
+  SUM(CASE WHEN t.neg_balance_flag=1 THEN 1 ELSE 0 END)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS neg_txn_count_14d,
+  COUNT(*) OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+                 RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS txn_count_14d,
+
+  -- Volatility (σ) & daily mean
+  STDDEV_POP(t.inflow_amount_pos)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS inflow_std_14d,
+  (SUM(t.inflow_amount_pos)
+     OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+           RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW)) / 14.0 AS inflow_mean_14d,
+
+  STDDEV_POP(t.balance_after)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS bal_std_14d,
+  AVG(NULLIF(t.balance_after,0))
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '13' DAY PRECEDING AND CURRENT ROW) AS bal_mean_14d,
+
+  /* Payroll proximity (default 1000 if none yet) */
+  COALESCE(
+    DATEDIFF(
+      'day',
+      MAX(CASE WHEN t.is_payroll=1 THEN t.posted_date_utc END)
+        OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+              RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+      t.posted_date_utc
+    ),
+    1000
+  ) AS days_since_last_payroll,
+
+  /* =========================
+     30-DAY WINDOWS (t-29..t)
+     ========================= */
+  -- Sums
+  SUM(t.inflow_amount_pos)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS inflow_sum_30d,
+  SUM(t.spend_amount_pos)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS spend_sum_30d,
+  SUM(CASE WHEN t.spend_bucket='essentials' THEN t.spend_amount_pos ELSE 0 END)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS essentials_spend_sum_30d,
+  SUM(CASE WHEN t.category='rent' THEN t.spend_amount_pos ELSE 0 END)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS rent_spend_sum_30d,
+
+  -- Counts
+  SUM(CASE WHEN t.neg_balance_flag=1 THEN 1 ELSE 0 END)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS neg_txn_count_30d,
+  COUNT(*) OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+                 RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS txn_count_30d,
+
+  -- Volatility (σ) & daily mean
+  STDDEV_POP(t.inflow_amount_pos)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS inflow_std_30d,
+  (SUM(t.inflow_amount_pos)
+     OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+           RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW)) / 30.0 AS inflow_mean_30d,
+
+  STDDEV_POP(t.balance_after)
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS bal_std_30d,
+  AVG(NULLIF(t.balance_after,0))
+    OVER (PARTITION BY t.user_id ORDER BY t.posted_date_utc
+          RANGE BETWEEN INTERVAL '29' DAY PRECEDING AND CURRENT ROW) AS bal_mean_30d
+
+FROM v_fct_transactions_clean t;
+
+/* ---------- User-level prior loan performance ---------- */
+CREATE OR REPLACE VIEW v_user_prior_loan_perf AS
+WITH cur AS (
+  SELECT loan_id, user_id, approved_at_utc
+  FROM v_fct_loans_clean
+),
+-- Prior APPROVED loans (strictly before current approval)
+prior_approved AS (
   SELECT
-    user_id,
-    CAST(posted_date_utc AS DATE) AS d,
-    direction,
-    amount,
-    category,
-    spend_bucket,
-    balance_after,
-    ROW_NUMBER() OVER (
-      PARTITION BY user_id, CAST(posted_date_utc AS DATE)
-      ORDER BY posted_date_utc DESC
-    ) AS rn_day_last
-  FROM v_fct_transactions_clean
+    c.loan_id       AS cur_loan_id,
+    p.*
+  FROM cur c
+  JOIN v_fct_loans_clean p
+    ON p.user_id = c.user_id
+   AND p.approved_at_utc < c.approved_at_utc   -- strictly prior approved loans
+),
+-- Prior UNAPPROVED loans requested before the current approval
+prior_unapproved AS (
+  SELECT
+    c.loan_id       AS cur_loan_id,
+    p.*
+  FROM cur c
+  JOIN v_fct_loans_clean p
+    ON p.user_id = c.user_id
+   AND p.requested_at_utc < c.approved_at_utc  -- requested before current approval
+   AND COALESCE(p.is_approved,0) = 0
 )
 SELECT
-  user_id,
-  d AS txn_date,
-  SUM(CASE WHEN direction='inflow'  THEN amount ELSE 0 END) AS inflow_sum,
-  SUM(CASE WHEN direction='outflow' THEN -amount ELSE 0 END) AS outflow_sum,
-  SUM(CASE WHEN category='rent' THEN -amount ELSE 0 END)     AS rent_outflow,
-  SUM(CASE WHEN spend_bucket='essentials'    THEN -amount ELSE 0 END) AS essentials_outflow,
-  SUM(CASE WHEN spend_bucket='discretionary' THEN -amount ELSE 0 END) AS discretionary_outflow,
-  MIN(balance_after) AS min_balance_day,
-  MAX(CASE WHEN rn_day_last=1 THEN balance_after END) AS eod_balance
-FROM t
-GROUP BY 1,2;
+  c.loan_id,
 
-CREATE OR REPLACE VIEW v_payroll_history AS
-SELECT user_id, CAST(posted_date_utc AS TIMESTAMP) AS payroll_ts
-FROM v_fct_transactions_clean
-WHERE is_payroll = 1;
+  /* any prior approved loan exists */
+  CASE WHEN COUNT(pa.loan_id) > 0 THEN 1 ELSE 0 END AS prior_loan_flag,
 
-CREATE OR REPLACE VIEW v_risk_features_at_approval AS
-WITH loans AS (
-  SELECT l.loan_id, l.user_id, l.amount, CAST(l.approved_at_utc AS TIMESTAMP) AS anchor_ts
+  /* average late days across prior loans (use field directly) */
+  AVG(CASE WHEN pa.is_disbursed = 1 THEN pa.late_days END) AS prior_avg_days_late,
+
+  /* average prior disbursed amount */
+  AVG(CASE WHEN pa.is_disbursed = 1 THEN pa.amount END)  AS prior_avg_amount,
+
+  /* average prior revenue/amount among disbursed */
+  AVG(CASE WHEN pa.is_disbursed = 1 AND pa.amount > 0
+           THEN (pa.revenue / pa.amount) END)            AS prior_avg_revenue_to_loan,
+
+  /* prior tip take rate among disbursed */
+  AVG(CASE WHEN pa.is_disbursed = 1
+           THEN CASE WHEN COALESCE(pa.tip_amount,0) > 0 THEN 1 ELSE 0 END
+      END)::DOUBLE                                       AS prior_tip_take_rate,
+
+  /* counts of prior loans by approval status */
+  COUNT(pa.loan_id)                                      AS prior_approved_loans_count,
+  COUNT(pu.loan_id)                                      AS prior_unapproved_loans_count
+
+FROM cur c
+LEFT JOIN prior_approved  pa ON pa.cur_loan_id = c.loan_id
+LEFT JOIN prior_unapproved pu ON pu.cur_loan_id = c.loan_id
+GROUP BY c.loan_id;
+
+
+-- ========================================================
+-- Risk Modeling Base (derived in txn_snapshot)
+-- ========================================================
+CREATE OR REPLACE VIEW v_risk_model_base AS
+WITH base AS (
+  SELECT
+    l.loan_id,
+    l.user_id,
+    l.amount,
+    l.approved_at_utc,
+    l.disbursed_at_utc,
+    l.due_date_clean,
+    l.is_default,
+    l.is_repaid,
+
+    -- user segments & baselines
+    u.province,
+    u.device_os,
+    u.acquisition_channel,
+    u.baseline_risk_score,
+    u.payroll_frequency,
+
+    -- prior default flag (strictly before this approval)
+    CASE WHEN EXISTS (
+      SELECT 1
+      FROM v_fct_loans_clean p
+      WHERE p.user_id = l.user_id
+        AND p.approved_at_utc < l.approved_at_utc
+        AND p.is_default = 1
+    ) THEN 1 ELSE 0 END AS prior_loan_default_flag
   FROM v_fct_loans_clean l
-  WHERE l.is_approved = 1 AND l.approved_at_utc IS NOT NULL
+  JOIN v_dim_users_clean u USING (user_id)
+  WHERE l.approved_at_utc IS NOT NULL
 ),
 
--- 30d window on transactions
-w30 AS (
-  SELECT lo.loan_id, tx.direction, tx.amount, tx.category
-  FROM loans lo
-  JOIN v_fct_transactions_clean tx
-    ON tx.user_id = lo.user_id
-   AND tx.posted_date_utc >= lo.anchor_ts - INTERVAL 30 DAY
-   AND tx.posted_date_utc <  lo.anchor_ts
-),
+/* ---------- Latest txn snapshot BEFORE approval ---------- */
+txn_snapshot AS (
+  SELECT * FROM (
+    SELECT
+      b.loan_id,
+      r.posted_date_utc,
 
--- 14d / 30d windows on daily rollups
-w14_day AS (
-  SELECT lo.loan_id, d.*
-  FROM loans lo
-  JOIN v_txn_daily d
-    ON d.user_id = lo.user_id
-   AND d.txn_date >= CAST(lo.anchor_ts AS DATE) - INTERVAL 14 DAY
-   AND d.txn_date <  CAST(lo.anchor_ts AS DATE)
-),
-w30_day AS (
-  SELECT lo.loan_id, d.*
-  FROM loans lo
-  JOIN v_txn_daily d
-    ON d.user_id = lo.user_id
-   AND d.txn_date >= CAST(lo.anchor_ts AS DATE) - INTERVAL 30 DAY
-   AND d.txn_date <  CAST(lo.anchor_ts AS DATE)
-),
+      /* atomic 14d */
+      r.inflow_sum_14d, r.spend_sum_14d,
+      r.essentials_spend_sum_14d, r.rent_spend_sum_14d,
+      r.txn_count_14d, r.neg_txn_count_14d,
+      r.inflow_mean_14d, r.inflow_std_14d,
+      r.bal_mean_14d,   r.bal_std_14d,
 
--- Payroll context
-payroll_ctx AS (
-  SELECT
-    lo.loan_id,
-    MAX(CASE WHEN p.payroll_ts < lo.anchor_ts THEN p.payroll_ts END) AS last_payroll_ts
-  FROM loans lo
-  LEFT JOIN v_payroll_history p
-    ON p.user_id = lo.user_id
-   AND p.payroll_ts >= lo.anchor_ts - INTERVAL 120 DAY
-   AND p.payroll_ts <  lo.anchor_ts
-  GROUP BY lo.loan_id
-),
-payroll_gaps AS (
-  SELECT
-    lo.loan_id,
-    p.payroll_ts AS ts,
-    LEAD(p.payroll_ts) OVER (PARTITION BY lo.loan_id ORDER BY p.payroll_ts) AS next_ts
-  FROM loans lo
-  JOIN v_payroll_history p
-    ON p.user_id = lo.user_id
-   AND p.payroll_ts >= lo.anchor_ts - INTERVAL 180 DAY
-   AND p.payroll_ts <  lo.anchor_ts
-),
-payroll_freq AS (
-  SELECT loan_id, MEDIAN(date_diff('day', ts, next_ts)) AS median_payroll_gap_days
-  FROM payroll_gaps
-  WHERE next_ts IS NOT NULL
-  GROUP BY loan_id
-),
+      /* atomic 30d */
+      r.inflow_sum_30d, r.spend_sum_30d,
+      r.essentials_spend_sum_30d, r.rent_spend_sum_30d,
+      r.txn_count_30d, r.neg_txn_count_30d,
+      r.inflow_mean_30d, r.inflow_std_30d,
+      r.bal_mean_30d,   r.bal_std_30d,
 
--- 30d aggregates (txn grain)
-agg_30 AS (
-  SELECT
-    loan_id,
-    SUM(CASE WHEN direction='inflow'  THEN amount ELSE 0 END)  AS inflow_sum_30d,
-    SUM(CASE WHEN direction='outflow' THEN -amount ELSE 0 END) AS outflow_sum_30d,
-    SUM(CASE WHEN category='rent' THEN -amount ELSE 0 END)     AS rent_sum_30d,
-    CASE
-      WHEN AVG(CASE WHEN direction='inflow' THEN amount END) IS NOT NULL
-      THEN STDDEV(CASE WHEN direction='inflow' THEN amount END)
-           / NULLIF(AVG(CASE WHEN direction='inflow' THEN amount END), 0)
-    END AS inflow_cv_30d
-  FROM w30
-  GROUP BY loan_id
-),
+      r.days_since_last_payroll,
 
--- 14d daily rollups
-agg_14 AS (
-  SELECT
-    loan_id,
-    AVG(eod_balance) AS avg_eod_balance_14d,
-    MIN(min_balance_day) AS min_balance_14d,
-    SUM(CASE WHEN min_balance_day < 0 THEN 1 ELSE 0 END) AS overdraft_days_14d,
-    SUM(inflow_sum)  AS inflow_sum_14d,
-    SUM(outflow_sum) AS outflow_sum_14d,
-    SUM(essentials_outflow)    AS essentials_outflow_14d,
-    SUM(discretionary_outflow) AS discretionary_outflow_14d,
-    STDDEV(inflow_sum - outflow_sum) AS net_cf_sd_daily_14d
-  FROM w14_day
-  GROUP BY loan_id
-),
+      /* derived */
+      CASE WHEN r.spend_sum_14d<>0 THEN r.rent_spend_sum_14d       / NULLIF(r.spend_sum_14d,0) END AS rent_share_outflows_14d,
+      CASE WHEN r.spend_sum_14d<>0 THEN r.essentials_spend_sum_14d / NULLIF(r.spend_sum_14d,0) END AS essentials_share_14d,
+      CASE WHEN r.spend_sum_30d<>0 THEN r.rent_spend_sum_30d       / NULLIF(r.spend_sum_30d,0) END AS rent_share_outflows_30d,
+      CASE WHEN r.spend_sum_30d<>0 THEN r.essentials_spend_sum_30d / NULLIF(r.spend_sum_30d,0) END AS essentials_share_30d,
 
--- 30d daily rollups
-agg_30_day AS (
-  SELECT
-    loan_id,
-    AVG(eod_balance) AS avg_eod_balance_30d,
-    SUM(CASE WHEN min_balance_day < 0 THEN 1 ELSE 0 END) AS overdraft_days_30d,
-    SUM(essentials_outflow)    AS essentials_outflow_30d,
-    SUM(discretionary_outflow) AS discretionary_outflow_30d,
-    STDDEV(inflow_sum - outflow_sum) AS net_cf_sd_daily_30d
-  FROM w30_day
-  GROUP BY loan_id
+      (r.inflow_sum_14d + r.spend_sum_14d) AS net_cashflow_14d,
+      (r.inflow_sum_30d + r.spend_sum_30d) AS net_cashflow_30d,
+
+      CASE WHEN ABS(r.inflow_sum_14d + r.spend_sum_14d) > 0
+           THEN r.inflow_std_14d / ABS(r.inflow_sum_14d + r.spend_sum_14d) END AS inflow_vol_to_netcashflow_14d,
+      CASE WHEN ABS(r.inflow_sum_14d + r.spend_sum_14d) > 0
+           THEN r.bal_std_14d   / ABS(r.inflow_sum_14d + r.spend_sum_14d) END AS bal_vol_to_netcashflow_14d,
+      CASE WHEN ABS(r.inflow_sum_30d + r.spend_sum_30d) > 0
+           THEN r.inflow_std_30d / ABS(r.inflow_sum_30d + r.spend_sum_30d) END AS inflow_vol_to_netcashflow_30d,
+      CASE WHEN ABS(r.inflow_sum_30d + r.spend_sum_30d) > 0
+           THEN r.bal_std_30d   / ABS(r.inflow_sum_30d + r.spend_sum_30d) END AS bal_vol_to_netcashflow_30d,
+
+      CASE WHEN r.spend_sum_14d<>0 THEN r.inflow_sum_14d / NULLIF(r.spend_sum_14d,0) END AS cashin_to_cashout_14d,
+      CASE WHEN r.spend_sum_30d<>0 THEN r.inflow_sum_30d / NULLIF(r.spend_sum_30d,0) END AS cashin_to_cashout_30d,
+      CASE WHEN r.txn_count_14d>0 THEN r.neg_txn_count_14d * 1.0 / NULLIF(r.txn_count_14d,0) END AS overdraft_txshare_14d,
+      CASE WHEN r.txn_count_30d>0 THEN r.neg_txn_count_30d * 1.0 / NULLIF(r.txn_count_30d,0) END AS overdraft_txshare_30d,
+
+      ROW_NUMBER() OVER (PARTITION BY b.loan_id ORDER BY r.posted_date_utc DESC) AS rn
+    FROM base b
+    JOIN v_fct_transactions_for_risk r
+      ON r.user_id = b.user_id
+     AND r.posted_date_utc < b.approved_at_utc
+  ) s
+  WHERE rn = 1
 )
 
 SELECT
-  lo.loan_id,
-  lo.user_id,
-  lo.amount,
-  lo.anchor_ts,
+  b.loan_id, b.user_id, b.amount, b.is_default,
+  b.approved_at_utc, b.disbursed_at_utc, b.due_date_clean,
 
-  -- Income cadence & stability
-  pf.median_payroll_gap_days,
-  CASE
-    WHEN pf.median_payroll_gap_days BETWEEN 6 AND 8  THEN 'weekly'
-    WHEN pf.median_payroll_gap_days BETWEEN 12 AND 17 THEN 'biweekly'
-    WHEN pf.median_payroll_gap_days BETWEEN 26 AND 35 THEN 'monthly'
-    ELSE 'irregular'
-  END AS payroll_frequency_bucket,
-  date_diff('day', pc.last_payroll_ts, lo.anchor_ts) AS days_since_last_payroll,
-  a30.inflow_cv_30d,
-  a30.inflow_sum_30d AS total_inflow_30d,
+  b.province, b.device_os, b.acquisition_channel,
+  b.baseline_risk_score, b.payroll_frequency,
 
-  -- Liquidity & balances
-  a14.avg_eod_balance_14d,
-  a14.min_balance_14d,
-  a14.overdraft_days_14d,
-  a30d.avg_eod_balance_30d,
-  a30d.overdraft_days_30d,
+  -- prior performance
+  p.prior_loan_flag,
+  b.prior_loan_default_flag,
+  p.prior_avg_days_late,
+  p.prior_avg_amount,
+  p.prior_avg_revenue_to_loan,
+  p.prior_tip_take_rate,
+  p.prior_approved_loans_count,
+  p.prior_unapproved_loans_count,
 
-  -- Totals & base ratios
-  a14.inflow_sum_14d,
-  a14.outflow_sum_14d,
-  a30.outflow_sum_30d AS total_outflow_30d,
-  CASE WHEN a14.inflow_sum_14d > 0 THEN a14.outflow_sum_14d * 1.0 / NULLIF(a14.inflow_sum_14d, 0) END AS outflow_to_inflow_14d,
-  CASE WHEN a30.inflow_sum_30d > 0 THEN a30.outflow_sum_30d * 1.0 / NULLIF(a30.inflow_sum_30d, 0) END AS outflow_to_inflow_30d,
+  -- flag for txn availability
+  CASE WHEN s.loan_id IS NULL THEN 0 ELSE 1 END AS txn_info_found,
 
-  -- Expense pressure & cushion (14d + 30d, denominated by outflow)
-  CASE WHEN a30.outflow_sum_30d > 0 THEN a30.rent_sum_30d * 1.0 / NULLIF(a30.outflow_sum_30d, 0) END AS rent_share_30d,
-  CASE WHEN a14.outflow_sum_14d > 0 THEN a14.essentials_outflow_14d    * 1.0 / NULLIF(a14.outflow_sum_14d, 0) END AS essentials_share_14d,
-  CASE WHEN a14.outflow_sum_14d > 0 THEN a14.discretionary_outflow_14d * 1.0 / NULLIF(a14.outflow_sum_14d, 0) END AS discretionary_share_14d,
-  CASE WHEN a30.outflow_sum_30d > 0 THEN a30d.essentials_outflow_30d    * 1.0 / NULLIF(a30.outflow_sum_30d, 0) END AS essentials_share_30d,
-  CASE WHEN a30.outflow_sum_30d > 0 THEN a30d.discretionary_outflow_30d * 1.0 / NULLIF(a30.outflow_sum_30d, 0) END AS discretionary_share_30d,
+  -- atomic txn features
+  s.inflow_sum_14d, s.spend_sum_14d, s.essentials_spend_sum_14d, s.rent_spend_sum_14d,
+  s.txn_count_14d,  s.neg_txn_count_14d, s.inflow_mean_14d, s.inflow_std_14d, s.bal_mean_14d, s.bal_std_14d,
+  s.inflow_sum_30d, s.spend_sum_30d, s.essentials_spend_sum_30d, s.rent_spend_sum_30d,
+  s.txn_count_30d,  s.neg_txn_count_30d, s.inflow_mean_30d, s.inflow_std_30d, s.bal_mean_30d, s.bal_std_30d,
+  s.days_since_last_payroll,
 
-  -- Momentum (net_cf / inflow)
-  CASE WHEN a14.inflow_sum_14d > 0
-       THEN (a14.inflow_sum_14d - a14.outflow_sum_14d) * 1.0 / NULLIF(a14.inflow_sum_14d, 0)
-  END AS net_cf_momentum_14d,
-  CASE WHEN a30.inflow_sum_30d > 0
-       THEN (a30.inflow_sum_30d - a30.outflow_sum_30d) * 1.0 / NULLIF(a30.inflow_sum_30d, 0)
-  END AS net_cf_momentum_30d,
+  -- derived txn features
+  s.rent_share_outflows_14d, s.essentials_share_14d,
+  s.rent_share_outflows_30d, s.essentials_share_30d,
+  s.net_cashflow_14d,        s.net_cashflow_30d,
+  s.inflow_vol_to_netcashflow_14d, s.bal_vol_to_netcashflow_14d,
+  s.inflow_vol_to_netcashflow_30d, s.bal_vol_to_netcashflow_30d,
+  s.cashin_to_cashout_14d, s.cashin_to_cashout_30d,
+  s.overdraft_txshare_14d, s.overdraft_txshare_30d
 
-  -- Volatility (daily net-cf sd / inflow)
-  CASE WHEN a14.inflow_sum_14d > 0 THEN a14.net_cf_sd_daily_14d * 1.0 / NULLIF(a14.inflow_sum_14d, 0) END AS inflow_volatility_14d,
-  CASE WHEN a30.inflow_sum_30d > 0 THEN a30d.net_cf_sd_daily_30d * 1.0 / NULLIF(a30.inflow_sum_30d, 0) END AS inflow_volatility_30d,
-
-  -- Balance ratios
-  CASE WHEN a14.outflow_sum_14d > 0 THEN a14.avg_eod_balance_14d * 1.0 / NULLIF(a14.outflow_sum_14d, 0) END AS balance_to_outflow_14d,
-  CASE WHEN a30.outflow_sum_30d > 0 THEN a30d.avg_eod_balance_30d * 1.0 / NULLIF(a30.outflow_sum_30d, 0) END AS balance_to_outflow_30d,
-  CASE WHEN a14.inflow_sum_14d  > 0 THEN a14.avg_eod_balance_14d * 1.0 / NULLIF(a14.inflow_sum_14d, 0)  END AS balance_to_inflow_14d,
-  CASE WHEN a30.inflow_sum_30d  > 0 THEN a30d.avg_eod_balance_30d * 1.0 / NULLIF(a30.inflow_sum_30d, 0)  END AS balance_to_inflow_30d
-
-FROM loans lo
-LEFT JOIN payroll_ctx   pc   ON lo.loan_id = pc.loan_id
-LEFT JOIN payroll_freq  pf   ON lo.loan_id = pf.loan_id
-LEFT JOIN agg_30        a30  ON lo.loan_id = a30.loan_id
-LEFT JOIN agg_14        a14  ON lo.loan_id = a14.loan_id
-LEFT JOIN agg_30_day    a30d ON lo.loan_id = a30d.loan_id;
-
-CREATE OR REPLACE VIEW v_default_label_30d AS
-SELECT
-  l.loan_id,
-  l.user_id,
-  CASE
-    WHEN l.is_disbursed = 1
-     AND l.is_default = 1
-    THEN 1 ELSE 0
-  END AS default_30d
-FROM v_fct_loans_clean l
-WHERE l.is_disbursed = 1;
-
-CREATE OR REPLACE VIEW v_canonical_risk_model AS
-SELECT
-  l.loan_id,
-  l.user_id,
-
-  -- Loan context (approval-time only)
-  l.amount AS loan_amount,
-  l.is_first_loan,
-  l.requested_at_utc,
-  l.approved_at_utc,
-  l.disbursed_at_utc ,
-  l.due_date_clean ,
-  l.repaid_at_utc ,
-  l.tip_amount,
-  l.fee, l.instant_transfer_fee, l.status ,  l.autopay_enrolled,
-
-  -- User / acquisition / baseline
-  u.device_os,
-  u.province,
-  u.acquisition_channel,
-  u.signup_month,
-  u.baseline_risk_score,
-  u.risk_score_decile,
-  u.payroll_frequency,
-  u.fico_band,
-
-  -- Approval-time risk features
-  rfa.median_payroll_gap_days,
-  rfa.payroll_frequency_bucket,
-  rfa.days_since_last_payroll,
-  rfa.inflow_cv_30d,
-  rfa.total_inflow_30d,
-  rfa.avg_eod_balance_14d,
-  rfa.min_balance_14d,
-  rfa.overdraft_days_14d,
-  rfa.avg_eod_balance_30d,
-  rfa.overdraft_days_30d,
-  rfa.inflow_sum_14d,
-  rfa.outflow_sum_14d,
-  rfa.total_outflow_30d,
-  rfa.outflow_to_inflow_14d,
-  rfa.outflow_to_inflow_30d,
-  rfa.rent_share_30d,
-  rfa.essentials_share_14d,
-  rfa.discretionary_share_14d,
-  rfa.essentials_share_30d,
-  rfa.discretionary_share_30d,
-  rfa.net_cf_momentum_14d,
-  rfa.net_cf_momentum_30d,
-  rfa.inflow_volatility_14d,
-  rfa.inflow_volatility_30d,
-  rfa.balance_to_outflow_14d,
-  rfa.balance_to_outflow_30d,
-  rfa.balance_to_inflow_14d,
-  rfa.balance_to_inflow_30d,
-
-  -- Historical loan performance (previous loans only)
-  hlp.hist_repay_rate,
-  hlp.hist_default_rate,
-  hlp.hist_default_count,
-  hlp.hist_avg_late_days,
-  hlp.hist_avg_late_days_count,
-
-  -- Label
-  dl.default_30d
-FROM v_fct_loans_clean l
-JOIN v_dim_users_clean u                  ON l.user_id = u.user_id
-LEFT JOIN v_user_risk_features urf        ON l.user_id = urf.user_id
-LEFT JOIN v_risk_features_at_approval rfa ON l.loan_id = rfa.loan_id
-LEFT JOIN v_default_label_30d dl          ON l.loan_id = dl.loan_id
-LEFT JOIN v_historical_loan_performance hlp ON l.loan_id = hlp.loan_id
-WHERE l.status IN ('repaid', 'default');
+FROM base b
+LEFT JOIN v_user_prior_loan_perf p ON p.loan_id = b.loan_id
+LEFT JOIN txn_snapshot s           ON s.loan_id = b.loan_id;

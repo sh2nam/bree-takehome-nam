@@ -12,11 +12,28 @@ This document provides comprehensive explanations of all features and metrics cr
 - **`fct_sessions`** - User session events and interactions
 - **`ab_assignments`** - A/B test experiment assignments
 
+### Canonical Views
+- **`v_dim_users_clean`** - Cleaned user dimension with UTC timestamps and derived features
+- **`v_fct_transactions_clean`** - Cleaned transactions with categorization and balance tracking
+- **`v_fct_loans_clean`** - Cleaned loans with lifecycle flags and unit economics
+- **`v_fct_sessions_clean`** - Cleaned sessions with funnel event flags
+- **`v_ab_assignments_clean`** - Cleaned A/B assignments with experiment categorization
+- **`v_user_funnel_base`** - User-level funnel progression metrics
+- **`v_funnel_by_segment`** - Segment-level funnel conversion rates
+- **`v_user_experiment_assignments`** - User experiment assignments with overlap detection
+- **`v_loans_with_experiments`** - Loans enriched with experiment data
+- **`v_fct_transactions_for_risk`** - Transaction features for risk modeling
+- **`v_user_prior_loan_perf`** - Prior loan performance by user
+- **`v_risk_model_base`** - Comprehensive risk modeling dataset
+
 ---
 
 ## Feature Categories
 
 ## 1. User Dimension Features (`v_dim_users_clean`)
+
+### Base User Data
+- **All original columns from `dim_users`** - user_id, signup_at, province, device_os, acquisition_channel, bank_linked_at, payroll_frequency, baseline_risk_score, fico_band
 
 ### Temporal Features
 - **`signup_at_utc`** - UTC normalized signup timestamp
@@ -40,47 +57,41 @@ This document provides comprehensive explanations of all features and metrics cr
 
 ## 2. Transaction Features (`v_fct_transactions_clean`)
 
+### Base Transaction Data
+- **All original columns from `fct_transactions`** - txn_id, user_id, posted_date, amount, direction, mcc, category, balance_after, is_payroll
+
+### Temporal Features
+- **`posted_date_utc`** - UTC normalized transaction timestamp
+
+### Amount & Direction Features
+- **`spend_amount_pos`** - Positive-signed outflow amounts (for aggregation)
+  - *Calculation*: `CASE WHEN direction = 'outflow' THEN -amount ELSE 0 END`
+- **`inflow_amount_pos`** - Positive-signed inflow amounts (for aggregation)
+  - *Calculation*: `CASE WHEN direction = 'inflow' THEN amount ELSE 0 END`
+
+### Liquidity & Balance Features
+- **`neg_balance_flag`** - Binary indicator for negative account balance
+  - *Calculation*: `CASE WHEN balance_after < 0 THEN 1 ELSE 0 END`
+- **`balance_before`** - Account balance before the transaction
+  - *Calculation*: `balance_after - amount`
+
 ### Spending Categorization
 - **`spend_bucket`** - Grouped spending categories for behavioral analysis
   - *essentials*: groceries, utilities, rent, transport
   - *discretionary*: entertainment, dining
   - *other*: all other categories
 
-### Liquidity & Balance Features
-- **`neg_balance_flag`** - Binary indicator for negative account balance
-- **`balance_before`** - Account balance before the transaction
-- **`spend_amount_pos`** - Positive-signed outflow amounts (for aggregation)
-- **`inflow_amount_pos`** - Positive-signed inflow amounts (for aggregation)
-
-### Rolling Financial Metrics (14-day & 30-day windows)
-- **`rolling_14d_spend_sum`** - Total outflows in trailing 14 days
-- **`rolling_30d_spend_sum`** - Total outflows in trailing 30 days
-- **`rolling_14d_inflow_sum`** - Total inflows in trailing 14 days
-- **`rolling_30d_inflow_sum`** - Total inflows in trailing 30 days
-- **`rolling_14d_net_cash_flow`** - Net cash flow (inflows - outflows) in trailing 14 days
-- **`rolling_30d_net_cash_flow`** - Net cash flow (inflows - outflows) in trailing 30 days
-
-### Volatility & Risk Ratios
-- **`rolling_14d_outflow_to_inflow`** - Spend-to-income ratio over 14 days
-  - *Business Logic*: Measures spending relative to income for affordability assessment
-- **`rolling_30d_outflow_to_inflow`** - Spend-to-income ratio over 30 days
-- **`rolling_14d_net_cashflow_stddev`** - Standard deviation of net cash flow (14d)
-- **`rolling_30d_net_cashflow_stddev`** - Standard deviation of net cash flow (30d)
-- **`vol_inflow_ratio_14d`** - Cash flow volatility normalized by income (14d)
-- **`vol_inflow_ratio_30d`** - Cash flow volatility normalized by income (30d)
-
-### Income Tracking Features
-- **`last_payroll_date`** - Most recent payroll transaction date
-- **`days_since_last_payroll`** - Days since last payroll (income recency)
-  - *Business Logic*: Tracks income cadence for loan timing and affordability
-
 ---
 
 ## 3. Loan Features (`v_fct_loans_clean`)
 
+### Base Loan Data
+- **All original columns from `fct_loans`** - loan_id, user_id, requested_at, approved_at, disbursed_at, due_date, repaid_at, amount, fee, tip_amount, instant_transfer_fee, status, late_days, chargeoff_flag, autopay_enrolled, principal_repaid, writeoff_amount, price_variant, tip_variant
+
 ### Temporal Features
 - **`requested_year`**, **`requested_month`** - Loan request cohorts
-- **UTC normalized timestamps** for all loan lifecycle events
+- **`requested_at_utc`**, **`approved_at_utc`**, **`disbursed_at_utc`**, **`repaid_at_utc`** - UTC normalized timestamps
+- **`due_date_clean`** - Cleaned due date as DATE type
 
 ### Lifecycle Binary Flags
 - **`is_approved`** - Loan was approved (1/0)
@@ -110,6 +121,14 @@ This document provides comprehensive explanations of all features and metrics cr
 
 ## 4. Session & Event Features (`v_fct_sessions_clean`)
 
+### Base Session Data
+- **All original columns from `fct_sessions`** - event_id, user_id, session_id, ts, event_name, screen, properties_json
+
+### Temporal Features
+- **`ts_utc`** - UTC normalized event timestamp
+- **`event_month`**, **`event_week`** - Event timing cohorts
+- **`event_dow`**, **`event_hour`** - Event timing for seasonality analysis
+
 ### Funnel Event Binary Flags
 - **`is_app_open`** - App open event (1/0)
 - **`is_bank_linked`** - Bank link success event (1/0)
@@ -125,13 +144,17 @@ This document provides comprehensive explanations of all features and metrics cr
 - **`session_duration_sec`** - Session length in seconds
 - **`events_per_session`** - Event density per session
 
-### Temporal Features
-- **`event_month`**, **`event_week`** - Event timing cohorts
-- **`event_dow`**, **`event_hour`** - Event timing for seasonality analysis
-
 ---
 
 ## 5. A/B Testing Features (`v_ab_assignments_clean`)
+
+### Base Assignment Data
+- **All original columns from `ab_assignments`** - assignment_id, user_id, experiment_name, variant, assigned_at
+
+### Temporal Features
+- **`assigned_at_utc`** - UTC normalized assignment timestamp
+- **`assigned_month`**, **`assigned_week`** - Assignment timing cohorts
+- **`assigned_year`**, **`assigned_dow`** - Assignment timing for analysis
 
 ### Experiment Identification
 - **`is_price_test`** - User in price experiment (1/0)
@@ -148,19 +171,56 @@ This document provides comprehensive explanations of all features and metrics cr
 ## 6. Analytical Views
 
 ### Funnel Analysis (`v_user_funnel_base`, `v_funnel_by_segment`)
-- **User-level funnel progression** from app open → bank link → request → approval → disbursement
-- **Segment-level user counts** by province, device OS, and acquisition channel
-- **Raw funnel counts** for conversion rate calculation in analysis layer
 
-### Experiment Analysis (`v_user_experiment_assignments`, `v_experiment_loan_performance`)
-- **User-level experiment assignments** with overlap detection
-- **Performance metrics by experiment group** (repayment rates, revenue, tips)
-- **Statistical testing support** for A/B test analysis
+#### `v_user_funnel_base` Features:
+- **`user_id`**, **`province`**, **`device_os`**, **`acquisition_channel`**, **`signup_year`** - User demographics
+- **`first_app_open_ts`** - Timestamp of first app open event
+- **`bank_linked_flag`** - Whether user linked bank (1/0)
+- **`bank_link_ts`** - Timestamp of bank linking
+- **`first_request_ts`** - Timestamp of first loan request
+- **`first_approved_ts`** - Timestamp of first loan approval
+- **`did_app_open`**, **`did_bank_link`**, **`did_request`**, **`did_approve`** - Funnel step completion flags
 
-### Risk Modeling (`v_user_risk_features`)
-- **Comprehensive risk features** combining demographics, transaction patterns, and loan history
-- **Historical performance indicators** (repayment rates, late payment patterns)
-- **Recency features** (days since last payroll, days since first loan)
+#### `v_funnel_by_segment` Features:
+- **Segment dimensions**: province, device_os, acquisition_channel, signup_year
+- **Funnel counts**: signups, app_opens, bank_links, requests, approvals
+- **Conversion rates**: app_open_rate, bank_link_rate, request_rate, approval_rate
+
+### Experiment Analysis (`v_user_experiment_assignments`, `v_loans_with_experiments`)
+
+#### `v_user_experiment_assignments` Features:
+- **`user_id`** - User identifier
+- **`price_variant`**, **`tip_variant`** - Experiment variant assignments
+- **`num_experiments`** - Number of experiments user is in
+- **`is_overlapping_user`** - Multi-experiment flag (1/0)
+- **`price_test_group`**, **`tip_test_group`** - Normalized group assignments
+
+#### `v_loans_with_experiments` Features:
+- **All loan data** from `v_fct_loans_clean`
+- **`price_variant`**, **`tip_variant`** - Experiment assignments at loan time
+- **`is_overlapping_user`** - Multi-experiment flag for statistical analysis
+
+### Risk Modeling (`v_fct_transactions_for_risk`, `v_user_prior_loan_perf`, `v_risk_model_base`)
+
+#### `v_fct_transactions_for_risk` Features:
+- **Base transaction data** with risk-relevant fields
+- **Rolling aggregations** (14d/30d windows): spend sums, inflow sums, transaction counts
+- **Derived ratios**: expense shares, volatility measures, cash flow ratios
+- **Income tracking**: payroll identification, days since last payroll
+
+#### `v_user_prior_loan_perf` Features:
+- **`loan_id`** - Current loan identifier
+- **`prior_loan_flag`** - Has prior approved loans (1/0)
+- **`prior_default_flag`** - Has prior defaults (1/0)
+- **Prior performance metrics**: average days late, default rate, approval counts
+
+#### `v_risk_model_base` Features:
+- **Loan identifiers**: loan_id, user_id, amount, is_default
+- **Timestamps**: approved_at_utc, disbursed_at_utc, due_date_clean
+- **User demographics**: province, device_os, acquisition_channel, baseline_risk_score, payroll_frequency
+- **Prior performance**: prior_loan_flag, prior_loan_default_flag, prior performance metrics
+- **Transaction features**: all derived transaction metrics (when available)
+- **`txn_info_found`** - Transaction data availability flag (1/0)
 
 ---
 
@@ -203,6 +263,25 @@ This document provides comprehensive explanations of all features and metrics cr
 - Key fields have no NULL values
 - Required relationships maintained
 - Data distribution checks for outliers
+
+## 7. Additional Analytical Views
+
+### `v_fct_transactions_for_risk` Derived Features
+- **Rolling windows (14d/30d)**: inflow_sum, spend_sum, essentials_spend_sum, rent_spend_sum
+- **Transaction counts**: txn_count, neg_txn_count (overdrafts)
+- **Statistical measures**: inflow_mean, inflow_std, bal_mean, bal_std
+- **Derived ratios**: rent_share_outflows, essentials_share, net_cashflow, volatility ratios
+- **Liquidity ratios**: cashin_to_cashout, overdraft transaction share
+- **Income tracking**: days_since_last_payroll
+
+### Data Quality & Coverage
+- **Referential integrity** maintained across all views
+- **UTC timestamp normalization** for consistent temporal analysis
+- **Transaction data coverage tracking** via `txn_info_found` flags
+- **Experiment overlap detection** for proper statistical analysis
+- **Missing value handling** with appropriate NULL checks and defaults
+
+---
 
 This feature engineering framework provides a robust foundation for comprehensive analysis of user behavior, loan performance, experiment effectiveness, and risk assessment in the Bree fintech platform.
 

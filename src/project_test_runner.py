@@ -69,13 +69,7 @@ class ProjectTester:
             'v_user_funnel_base',
             'v_funnel_by_segment',
             'v_user_experiment_assignments',
-            'v_experiment_loan_performance',
-            'v_user_risk_features',
-            'v_loans_with_experiments',
-            'v_experiment_daily_assignments',
-            'v_funnel_by_experiment',
-            'v_loan_tip_features',
-            'v_experiment_loans_risk'
+            'v_loans_with_experiments'
         ]
         
         try:

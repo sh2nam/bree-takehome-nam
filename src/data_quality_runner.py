@@ -83,7 +83,7 @@ class DataQualityRunner:
             "categories": {}
         }
         
-        # Define check categories and their corresponding views
+        # Define check categories and their corresponding views (only existing views)
         check_categories = {
             "row_count_reconciliation": "dq_row_count_reconciliation",
             "null_key_checks": "dq_null_key_checks", 
@@ -93,10 +93,10 @@ class DataQualityRunner:
             "user_validations": "dq_user_validations",
             "session_validations": "dq_session_validations",
             "ab_test_validations": "dq_ab_test_validations",
-            "risk_row_counts": "dq_risk_row_counts",
-            "risk_timestamp_validations": "dq_risk_timestamp_validations",
-            "risk_ratio_validations": "dq_risk_ratio_validations",
-            "risk_distribution_checks": "dq_risk_distribution_checks"
+            "business_rules": "dq_business_rules",
+            "risk_model_coverage": "dq_risk_model_coverage",
+            "funnel_completeness": "dq_funnel_completeness",
+            "distribution_checks": "dq_distribution_checks"
         }
         
         # Execute each category
@@ -113,18 +113,23 @@ class DataQualityRunner:
         
         # Get summary report with fallback
         try:
-            # Try extended summary first
-            summary_df = self.conn.execute("SELECT * FROM dq_summary_report_extended").fetchdf()
+            # Use basic summary report (extended doesn't exist)
+            summary_df = self.conn.execute("SELECT * FROM dq_summary_report").fetchdf()
             report["summary"] = summary_df.to_dict('records')
             
-            # Calculate overall status
-            total_failed = summary_df['failed_checks'].sum()
+            # Calculate overall status - handle different column structures
+            if 'failed_checks' in summary_df.columns:
+                total_failed = summary_df['failed_checks'].sum()
+            else:
+                # Count FAIL statuses in status column
+                total_failed = len(summary_df[summary_df['status'] == 'FAIL']) if 'status' in summary_df.columns else 0
+            
             report["overall_status"] = "PASS" if total_failed == 0 else "FAIL"
             report["total_failed_checks"] = int(total_failed)
             report["total_check_categories"] = len(summary_df)
             
         except Exception as e:
-            logger.warning(f"Extended summary failed ({e}), falling back to basic summary")
+            logger.warning(f"Summary report failed ({e}), falling back to basic summary")
             try:
                 # Fallback to original summary
                 summary_df = self.conn.execute("SELECT * FROM dq_summary_report").fetchdf()
@@ -168,11 +173,17 @@ class DataQualityRunner:
             print("\nCATEGORY BREAKDOWN:")
             print("-" * 80)
             for category in report['summary']:
-                status_icon = "✅" if category['category_status'] == 'PASS' else "❌"
-                print(f"{status_icon} {category['check_category']:<35} | "
-                      f"Failed: {category['failed_checks']:>2} | "
-                      f"Total: {category['total_checks']:>2} | "
-                      f"Status: {category['category_status']}")
+                # Handle different possible column names for status
+                status = category.get('category_status', category.get('status', 'UNKNOWN'))
+                failed = category.get('failed_checks', 0)
+                total = category.get('total_checks', category.get('check_count', 0))
+                category_name = category.get('check_category', 'Unknown Category')
+                
+                status_icon = "✅" if status == 'PASS' else "❌"
+                print(f"{status_icon} {category_name:<35} | "
+                      f"Failed: {failed:>2} | "
+                      f"Total: {total:>2} | "
+                      f"Status: {status}")
         else:
             # Fallback: show categories from detailed report
             print("\nCATEGORY BREAKDOWN:")
